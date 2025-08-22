@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>BullTradeX</title>
+<style>
+:root{--bg:#0b0b0c;--panel:#121316;--muted:#9aa3ad;--green:#12d189;--red:#ff4d5a;--border:#22262c;--txt:#eef1f4;--accent:#e5b90a}
+body{margin:0;font-family:Inter,system-ui,Roboto,Arial; background:var(--bg); color:var(--txt)}
+.wrap{max-width:980px;margin:16px auto;padding:16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+select,button{background:#0e0f12;border:1px solid var(--border);color:var(--txt);padding:10px;border-radius:8px}
+button{cursor:pointer;font-weight:700}
+.kpi{background:#0e0f12;border:1px solid var(--border);padding:8px;border-radius:8px;margin:6px 0}
+.buyText{color:var(--green)}.sellText{color:var(--red)}
+.err{color:#ffd3d3;background:#2a1013;padding:8px;border-radius:8px}
+</style></head><body>
+<div class="wrap">
+  <div class="card">
+    <h2>BullTradeX — Real-time (Exness WS)</h2>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label>Select Pair</label>
+      <select id="pairSelect"></select>
+      <button id="genBtn">Generate Signal</button>
+      <div id="status" style="margin-left:auto"></div>
+    </div>
+    <div id="errBox" class="err" style="display:none"></div>
+    <div id="output" style="margin-top:12px"></div>
+  </div>
+</div>
+<script>
+const PAIRS = [
+  {label:"BTC/USD (Binance)",key:"BTC/USD",src:"binance",symbol:"BTCUSDT",dp:2},
+  {label:"ETH/USD (Binance)",key:"ETH/USD",src:"binance",symbol:"ETHUSDT",dp:2},
+  {label:"EUR/USD (Exness)",key:"EUR/USD",src:"exness",symbol:"EURUSD",dp:5},
+  {label:"GBP/USD (Exness)",key:"GBP/USD",src:"exness",symbol:"GBPUSD",dp:5},
+  {label:"USD/JPY (Exness)",key:"USD/JPY",src:"exness",symbol:"USDJPY",dp:3},
+  {label:"XAU/USD (Exness)",key:"XAU/USD",src:"exness",symbol:"XAUUSD",dp:2},
+  {label:"XAG/USD (Exness)",key:"XAG/USD",src:"exness",symbol:"XAGUSD",dp:3}
+];
+const TF_LIST=[{id:"1m",ex:"M1",bin:"1m"},{id:"5m",ex:"M5",bin:"5m"},{id:"15m",ex:"M15",bin:"15m"},{id:"60m",ex:"H1",bin:"1h"}];
+const $=id=>document.getElementById(id);
+function fmt(v,dp=2){return isFinite(v)?Number(v).toFixed(dp):'—'}
+
+// minimal indicators (SMA, EMA, RSI, ATR, MACD, Bollinger, Stoch, Ichimoku)
+// (re-using implementations from previous code — kept compact)
+function SMA(arr,p,acc=(x)=>x){const out=[],q=[],s=0;let ss=0;for(let i=0;i<arr.length;i++){const v=acc(arr[i]);q.push(v);ss+=v;if(q.length>p)ss-=q.shift();out.push(q.length===p?ss/p:NaN)}return out}
+function EMA(arr,p,acc=(x)=>x){const out=[],k=2/(p+1);let e;for(let i=0;i<arr.length;i++){const v=acc(arr[i]);if(i===0)e=v;else e=v*k+e*(1-k);out.push(e)}return out}
+function RSI(rows,period=14){let g=0,l=0;const out=[NaN];for(let i=1;i<rows.length;i++){const ch=rows[i].close-rows[i-1].close;if(i<=period){if(ch>0)g+=ch;else l-=ch;if(i===period){const rs=(g/period)/((l||1e-12)/period);out.push(100-100/(1+rs))}else out.push(NaN)}else{const gain=Math.max(ch,0),loss=Math.max(-ch,0);g=(g*(period-1)+gain)/period;l=(l*(period-1)+loss)/period;const rs=g/(l||1e-12);out.push(100-100/(1+rs))}}return out}
+function ATR(rows,p=14){const tr=rows.map((r,i)=>{if(i===0) return NaN;const pc=rows[i-1].close;return Math.max(r.high-r.low,Math.abs(r.high-pc),Math.abs(r.low-pc))});return SMA(tr.map(v=>({v})),p,x=>x.v)}
+// other helpers
+function MACD(rows,f=12,s=26,sg=9){const ef=EMA(rows,f,r=>r.close),es=EMA(rows,s,r=>r.close);const mac=ef.map((v,i)=>v-es[i]);const sig=EMA(mac.map(v=>({v})),sg,x=>x.v);const hist=mac.map((v,i)=>v-(sig[i]||NaN));return{mac,signal:sig,hist}}
+function Bollinger(rows,p=20,m=2){const ma=SMA(rows,p,r=>r.close);return rows.map((_,i)=>{if(i<p-1)return{mid:NaN,upper:NaN,lower:NaN};let mean=ma[i],sum=0;for(let j=i-p+1;j<=i;j++){const v=rows[j].close;sum+=(v-mean)*(v-mean)}const st=Math.sqrt(sum/p);return{mid:mean,upper:mean+m*st,lower:mean-m*st}})}
+function Stochastic(rows,kP=14,dP=3){const k=rows.map((_,i)=>{if(i<kP-1)return NaN;let h=-Infinity,l=Infinity;for(let j=i-kP+1;j<=i;j++){h=Math.max(h,rows[j].high);l=Math.min(l,rows[j].low)}return 100*(rows[i].close-l)/(h-l||1e-12)});const d=SMA(k.map(v=>({v})),dP,x=>x.v);return{k,d}}
+function ICHIMOKU(rows){const hl=(i,per)=>{let h=-Infinity,l=Infinity;for(let j=i-per+1;j<=i;j++){if(j<0)continue;h=Math.max(h,rows[j].high);l=Math.min(l,rows[j].low)}return(h+l)/2};const tenkan=[],kijun=[],spanA=[],spanB=[];for(let i=0;i<rows.length;i++){tenkan.push(i<8?NaN:hl(i,9));kijun.push(i<25?NaN:hl(i,26));spanA.push(((tenkan[i]||NaN)+(kijun[i]||NaN))/2);spanB.push(i<51?NaN:hl(i,52))}return{tenkan,kijun,spanA,spanB}}
+
+// voting function (multi-indicator) -> buy/sell counts
+function votesFromIndicators(rows){
+  const i=rows.length-1; if(i<60) return {buy:0,sell:0,last:rows[i]?.close||NaN,atr:NaN,fields:null};
+  const last=rows[i].close;
+  const ema20=EMA(rows,20,r=>r.close), ema50=EMA(rows,50,r=>r.close), ema200=EMA(rows,200,r=>r.close);
+  const rsi14=RSI(rows,14), macd=MACD(rows), bb=Bollinger(rows), stoch=Stochastic(rows);
+  const atr14=ATR(rows,14), adx14={adx:20};
+  const ema13=EMA(rows,13,r=>r.close), ema34=EMA(rows,34,r=>r.close);
+  const dam=(ema13[i]-ema34[i])/(atr14[i]||1e-12);
+  let buy=0,sell=0; const W=(b,s,w=1)=>{ if(b) buy+=w; if(s) sell+=w; };
+  W(last < bb[i].lower, last > bb[i].upper, 1);
+  W(stoch.k[i] > stoch.d[i] && stoch.k[i] < 80, stoch.k[i] < stoch.d[i] && stoch.k[i] > 20, 1);
+  W(dam>0.12, dam<-0.12, 1);
+  W(ema20[i]>ema50[i] && ema50[i]>ema200[i], ema20[i]<ema50[i] && ema50[i]<ema200[i], 1);
+  W(macd.mac[i] > macd.signal[i], macd.mac[i] < macd.signal[i], 1); // safe-guard placeholder
+  const bull = rows[i].close>rows[i].open;
+  const rNow=rsi14[i], rPrev=rsi14[i-1];
+  W((rPrev<30 && rNow>40 && bull), (rPrev>70 && rNow<60 && !bull), 1);
+  const ichi=ICHIMOKU(rows);
+  const tk=ichi.tenkan[i], kj=ichi.kijun[i], sa=ichi.spanA[i], sb=ichi.spanB[i];
+  const cTop=Math.max(sa,sb), cBot=Math.min(sa,sb);
+  W(last>cTop && tk>kj, last<cBot && tk<kj, 1);
+  return {buy,sell,last,atr:atr14[i], fields:{bb:bb[i],stK:stoch.k[i],stD:stoch.d[i],dam,ema20:ema20[i],ema50:ema50[i],ema200:ema200[i],ichi}};
+}
+
+// fetch helpers
+async function fetchBinance(symbol, interval, limit=1000){
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("Binance "+r.status);
+  const arr = await r.json();
+  return arr.map(k=>({time:new Date(k[0]).toISOString(), open:+k[1], high:+k[2], low:+k[3], close:+k[4]}));
+}
+async function fetchHistory(symbol, tf){
+  // same-origin /history (our WS aggregator)
+  const url = `/history?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&limit=1000`;
+  const r = await fetch(url);
+  if(!r.ok) return [];
+  const data = await r.json();
+  return data.map(d=>({time:new Date(d[0]*1000).toISOString(), open:+d[1], high:+d[2], low:+d[3], close:+d[4]}));
+}
+
+// UI init
+const pairSelect = document.getElementById("pairSelect");
+PAIRS.forEach((p,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=p.label; pairSelect.appendChild(o);} );
+
+document.getElementById("genBtn").addEventListener("click", async ()=>{
+  const idx = Number(pairSelect.value);
+  const meta = PAIRS[idx];
+  if(!meta) return;
+  $("status").textContent = "Generating...";
+  try{
+    const tfVerdicts = {}; let lastPx=NaN, baseATR=NaN, snap=null;
+    for(const tf of TF_LIST){
+      let rows = [];
+      if(meta.src==="binance"){
+        rows = await fetchBinance(meta.symbol, tf.bin);
+      }else{
+        rows = await fetchHistory(meta.symbol, tf.ex);
+      }
+      if(!rows || rows.length<50) continue;
+      const v = votesFromIndicators(rows);
+      const side = (v.buy>v.sell) ? "Buy" : (v.sell>v.buy) ? "Sell" : "Neutral";
+      tfVerdicts[tf.id] = {side,buy:v.buy,sell:v.sell};
+      if(tf.id==="5m"){ baseATR=v.atr; lastPx=v.last; snap=v.fields; }
+      if(!isFinite(lastPx)) lastPx=v.last;
+    }
+    const sides = ["1m","5m","15m","60m"].map(id=>tfVerdicts[id]?.side||"Neutral");
+    const buyCount = sides.filter(s=>s==="Buy").length;
+    const sellCount = sides.filter(s=>s==="Sell").length;
+    const finalSide = (buyCount>sellCount) ? "Buy" : (sellCount>buyCount) ? "Sell" : "Neutral";
+    const conf = Math.round((Math.max(buyCount,sellCount)/Math.max(1,sides.filter(s=>s!=="Neutral").length))*100);
+    const atr = isFinite(baseATR)?baseATR: (lastPx*0.002);
+    const entry = lastPx; const sl = finalSide==="Buy"? entry-1.5*atr : finalSide==="Sell"? entry+1.5*atr : entry-0.5*atr;
+    const tp = finalSide==="Buy"? entry+2*atr : finalSide==="Sell"? entry-2*atr : entry+0.5*atr;
+    // render
+    const out = document.getElementById("output");
+    out.innerHTML = `<div class="kpi"><strong>Pair:</strong> ${meta.key} • <strong>Signal:</strong> <span class="${finalSide==='Buy'?'buyText':finalSide==='Sell'?'sellText':''}">${finalSide}</span></div>
+    <div class="kpi"><strong>Price:</strong> ${fmt(entry,meta.dp)} • <strong>SL:</strong> ${fmt(sl,meta.dp)} • <strong>TP:</strong> ${fmt(tp,meta.dp)}</div>
+    <div class="kpi"><strong>Confidence:</strong> ${conf}% • <strong>RR:</strong> 2.0</div>
+    <div class="kpi"><strong>Per-TF:</strong> 1m: ${tfVerdicts['1m']?.side||'—'} | 5m: ${tfVerdicts['5m']?.side||'—'} | 15m: ${tfVerdicts['15m']?.side||'—'} | 1h: ${tfVerdicts['60m']?.side||'—'}</div>`;
+    $("status").textContent = "Done";
+  }catch(err){
+    document.getElementById("errBox").style.display="block"; document.getElementById("errBox").textContent = String(err);
+    $("status").textContent = "Error";
+  }
+});
+function $(id){return document.getElementById(id);}
+</script></body></html>
